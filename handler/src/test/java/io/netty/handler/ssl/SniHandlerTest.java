@@ -81,7 +81,10 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.withSettings;
 
 public class SniHandlerTest {
 
@@ -854,5 +857,101 @@ public class SniHandlerTest {
             ch.finishAndReleaseAll();
             releaseAll(context);
         }
+    }
+
+    // Expected defaults of SslClientHelloHandler / AbstractSniHandler.
+    private static final int DEFAULT_MAX_CLIENT_HELLO_LENGTH = 64 * 1024;
+    private static final long DEFAULT_HANDSHAKE_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
+
+    @Test
+    public void testSniHandlerFailsOnTooBigClientHelloByDefault() throws Exception {
+        @SuppressWarnings("unchecked")
+        Mapping<String, SslContext> mapping = mock(Mapping.class);
+
+        // A few bytes announcing a 16MB ClientHello must not make us allocate the announced length.
+        assertClientHelloRejected(new SniHandler(mapping), SslClientHelloHandler.MAX_CLIENT_HELLO_LENGTH);
+        assertClientHelloRejected(new SniHandler(mapping), DEFAULT_MAX_CLIENT_HELLO_LENGTH + 1);
+        assertClientHelloRejected(new SniHandler(mapping, 0L), DEFAULT_MAX_CLIENT_HELLO_LENGTH + 1);
+
+        // A ClientHello that is exactly at the default limit is still aggregated.
+        assertClientHelloAggregated(new SniHandler(mapping), DEFAULT_MAX_CLIENT_HELLO_LENGTH);
+    }
+
+    @Test
+    public void testSniHandlerZeroMaxClientHelloLengthDisablesLimit() throws Exception {
+        @SuppressWarnings("unchecked")
+        Mapping<String, SslContext> mapping = mock(Mapping.class);
+
+        assertClientHelloAggregated(new SniHandler(mapping, 0, 0L), DEFAULT_MAX_CLIENT_HELLO_LENGTH + 1);
+    }
+
+    @Test
+    public void testSniHandlerUsesDefaultHandshakeTimeout() throws Exception {
+        @SuppressWarnings("unchecked")
+        Mapping<String, SslContext> mapping = mock(Mapping.class);
+        SniHandler handler = new SniHandler(mapping);
+
+        EmbeddedChannel ch = new EmbeddedChannel();
+        ch.freezeTime();
+        ch.pipeline().addLast(handler);
+        try {
+            // Announce a ClientHello within the limit but never send the rest of it.
+            assertFalse(ch.writeInbound(clientHelloRecordHeader(ch.alloc(), DEFAULT_MAX_CLIENT_HELLO_LENGTH)));
+
+            ch.advanceTimeBy(DEFAULT_HANDSHAKE_TIMEOUT_MILLIS - 1, TimeUnit.MILLISECONDS);
+            ch.runScheduledPendingTasks();
+            assertTrue(ch.isActive());
+
+            ch.advanceTimeBy(1, TimeUnit.MILLISECONDS);
+            ch.runScheduledPendingTasks();
+            assertFalse(ch.isActive());
+        } finally {
+            ch.finishAndReleaseAll();
+        }
+        assertEquals(DEFAULT_HANDSHAKE_TIMEOUT_MILLIS, handler.handshakeTimeoutMillis);
+    }
+
+    @Test
+    public void testAbstractSniHandlerDefaults() throws Exception {
+        AbstractSniHandler<?> handler = mock(AbstractSniHandler.class,
+                withSettings().useConstructor().defaultAnswer(CALLS_REAL_METHODS));
+        assertClientHelloRejected(handler, DEFAULT_MAX_CLIENT_HELLO_LENGTH + 1);
+        assertEquals(DEFAULT_HANDSHAKE_TIMEOUT_MILLIS, handler.handshakeTimeoutMillis);
+    }
+
+    private static void assertClientHelloRejected(AbstractSniHandler<?> handler, int handshakeLength) {
+        EmbeddedChannel ch = new EmbeddedChannel(handler);
+        try {
+            ch.writeInbound(clientHelloRecordHeader(ch.alloc(), handshakeLength));
+            fail("ClientHello with length " + handshakeLength + " should have been rejected");
+        } catch (TooLongFrameException expected) {
+            // The handler must also close the connection.
+            assertFalse(ch.isActive());
+        } finally {
+            ch.finishAndReleaseAll();
+        }
+    }
+
+    private static void assertClientHelloAggregated(AbstractSniHandler<?> handler, int handshakeLength) {
+        EmbeddedChannel ch = new EmbeddedChannel(handler);
+        try {
+            // Nothing is forwarded yet as the handler waits for the rest of the ClientHello.
+            assertFalse(ch.writeInbound(clientHelloRecordHeader(ch.alloc(), handshakeLength)));
+            assertTrue(ch.isActive());
+        } finally {
+            ch.finishAndReleaseAll();
+        }
+    }
+
+    private static ByteBuf clientHelloRecordHeader(ByteBufAllocator alloc, int handshakeLength) {
+        ByteBuf buffer = alloc.buffer();
+        buffer.writeByte(0x16);      // Content Type: Handshake
+        buffer.writeShort((short) 0x0303); // TLS 1.2
+        buffer.writeShort((short) 0x0006); // Packet length
+
+        buffer.writeByte((byte) 0x01); // Client Hello
+        buffer.writeMedium(handshakeLength); // Length
+        buffer.writeShort((short) 0x0303); // TLS 1.2
+        return buffer;
     }
 }
