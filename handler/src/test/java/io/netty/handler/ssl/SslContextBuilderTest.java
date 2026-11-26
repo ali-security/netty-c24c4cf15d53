@@ -18,6 +18,8 @@ package io.netty.handler.ssl;
 import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
 import io.netty.util.CharsetUtil;
+import io.netty.util.ReferenceCountUtil;
+import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
@@ -27,6 +29,7 @@ import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509ExtendedKeyManager;
 import javax.net.ssl.X509ExtendedTrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.io.ByteArrayInputStream;
 import java.net.Socket;
 import java.security.Principal;
@@ -253,6 +256,91 @@ public class SslContextBuilderTest {
     @Test
     public void testClientContextWithSecureRandom() throws Exception {
         testClientContextWithSecureRandom(SslProvider.JDK, new SpySecureRandom());
+    }
+
+    @Test
+    public void testEndpointIdentificationWithNonExtendedTrustManagerOpenssl() throws Exception {
+        OpenSsl.ensureAvailability();
+        testEndpointIdentificationWithNonExtendedTrustManager(SslProvider.OPENSSL);
+    }
+
+    @Test
+    public void testEndpointIdentificationWithNonExtendedTrustManagerOpensslRefCnt() throws Exception {
+        OpenSsl.ensureAvailability();
+        testEndpointIdentificationWithNonExtendedTrustManager(SslProvider.OPENSSL_REFCNT);
+    }
+
+    @Test
+    public void testEndpointIdentificationWithExtendedTrustManagerOpenssl() throws Exception {
+        OpenSsl.ensureAvailability();
+        testEndpointIdentificationWithExtendedTrustManager(SslProvider.OPENSSL);
+    }
+
+    @Test
+    public void testEndpointIdentificationWithExtendedTrustManagerOpensslRefCnt() throws Exception {
+        OpenSsl.ensureAvailability();
+        testEndpointIdentificationWithExtendedTrustManager(SslProvider.OPENSSL_REFCNT);
+    }
+
+    private static void testEndpointIdentificationWithNonExtendedTrustManager(SslProvider provider)
+            throws Exception {
+        // A plain X509TrustManager that accepts every chain and has no way to check the peer host name.
+        final X509TrustManager trustManager = new X509TrustManager() {
+            @Override
+            public void checkClientTrusted(X509Certificate[] chain, String authType) { }
+
+            @Override
+            public void checkServerTrusted(X509Certificate[] chain, String authType) { }
+
+            @Override
+            public X509Certificate[] getAcceptedIssuers() {
+                return new X509Certificate[0];
+            }
+        };
+        final SslContextBuilder builder = SslContextBuilder.forClient()
+                .sslProvider(provider)
+                .trustManager(trustManager)
+                .endpointIdentificationAlgorithm("HTTPS");
+
+        X509TrustManager effective = trustManager;
+        if (PlatformDependent.javaVersion() >= 7) {
+            effective = OpenSslX509TrustManagerWrapper.wrapIfNeeded(trustManager);
+        }
+        if (ReferenceCountedOpenSslContext.useExtendedTrustManager(effective)) {
+            // The JDK wrapped the trust manager into one that performs endpoint identification itself.
+            SslContext context = builder.build();
+            try {
+                SSLEngine engine = context.newEngine(UnpooledByteBufAllocator.DEFAULT, "netty.io", 443);
+                ReferenceCountUtil.release(engine);
+            } finally {
+                ReferenceCountUtil.release(context);
+            }
+        } else {
+            // The host name would never be verified, so building the context must fail instead of silently
+            // accepting a certificate issued for another host.
+            SSLException e = assertThrows(SSLException.class, new Executable() {
+                @Override
+                public void execute() throws Throwable {
+                    SslContext context = builder.build();
+                    ReferenceCountUtil.release(context);
+                }
+            });
+            assertTrue(e.getCause() instanceof UnsupportedOperationException, String.valueOf(e.getCause()));
+        }
+    }
+
+    private static void testEndpointIdentificationWithExtendedTrustManager(SslProvider provider) throws Exception {
+        SslContext context = SslContextBuilder.forClient()
+                .sslProvider(provider)
+                .trustManager(new EmptyExtendedX509TrustManager())
+                .endpointIdentificationAlgorithm("HTTPS")
+                .build();
+        try {
+            SSLEngine engine = context.newEngine(UnpooledByteBufAllocator.DEFAULT, "netty.io", 443);
+            ReferenceCountUtil.release(engine);
+        } finally {
+            ReferenceCountUtil.release(context);
+        }
     }
 
     private static void testKeyStoreType(SslProvider provider) throws Exception {
